@@ -70,7 +70,8 @@ func main() {
 	}
 }
 
-// cleanupLoop 周期性删除过期的 auth_request 行，防止 state 表无限增长。
+// cleanupLoop 周期性删除过期的 auth_request 行、收敛过期的身份生命周期流程，
+// 防止状态表无限增长，并保证未完成的停用尝试不会把身份永久卡在 pending。
 func cleanupLoop(ctx context.Context, st *store.Store, interval, ttl time.Duration,
 	logger *log.Logger, stop chan struct{}) {
 	ticker := time.NewTicker(interval)
@@ -84,6 +85,11 @@ func cleanupLoop(ctx context.Context, st *store.Store, interval, ttl time.Durati
 		case <-ticker.C:
 			if err := st.DeleteExpiredAuthRequests(ctx, time.Now().Add(-ttl)); err != nil {
 				logger.Printf("cleanup auth_requests: %v", err)
+			}
+			if n, err := st.ExpireOverdueLifecycles(ctx, time.Now()); err != nil {
+				logger.Printf("cleanup identity lifecycles: %v", err)
+			} else if n > 0 {
+				logger.Printf("cleanup expired identity lifecycles: %d", n)
 			}
 		}
 	}

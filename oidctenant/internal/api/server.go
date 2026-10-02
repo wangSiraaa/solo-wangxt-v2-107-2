@@ -63,6 +63,12 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET "+linkCBPath, s.requireSession(s.linkCallback))
 	mux.HandleFunc("GET /t/{slug}/api/links/{token}", s.requireSession(s.linkFinalize))
 
+	// 身份停用与恢复生命周期
+	mux.HandleFunc("POST /t/{slug}/api/identities/deactivate", s.requireSession(s.deactivateStart))
+	mux.HandleFunc("POST /t/{slug}/api/identities/reactivate", s.requireSession(s.reactivateStart))
+	mux.HandleFunc("GET "+lifecycleCBPath, s.requireSession(s.lifecycleCallback))
+	mux.HandleFunc("GET /t/{slug}/api/identities/events", s.requireSession(s.identityEvents))
+
 	// 受保护的业务接口
 	mux.HandleFunc("GET /t/{slug}/api/me", s.requireSession(s.me))
 	mux.HandleFunc("POST /t/{slug}/api/logout", s.requireSession(s.logout))

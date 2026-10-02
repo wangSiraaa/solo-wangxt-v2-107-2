@@ -23,6 +23,15 @@ var (
 	ErrConsumed = errors.New("store: auth request already consumed or unknown")
 	// ErrConflict 表示唯一约束冲突（绑定冲突）。
 	ErrConflict = errors.New("store: unique constraint violation")
+	// ErrIdentityDisabled 表示身份已停用（或正处于停用待证明窗口），不可登录/关联。
+	ErrIdentityDisabled = errors.New("store: identity is disabled")
+	// ErrLastIdentity 表示这是成员当前唯一可用身份，不允许停用。
+	ErrLastIdentity = errors.New("store: cannot deactivate the last usable identity")
+	// ErrLifecycleConflict 表示生命周期流程的当前状态不允许该操作
+	// （无开放流程、身份状态不匹配、必须同会话/同身份完成证明等）。
+	ErrLifecycleConflict = errors.New("store: identity lifecycle state conflict")
+	// ErrLifecycleExpired 表示恢复窗口或证明窗口已过，旧回调/旧请求不得推进状态。
+	ErrLifecycleExpired = errors.New("store: identity lifecycle window expired")
 )
 
 type Store struct {
@@ -206,28 +215,47 @@ func (s *Store) LoginOrRegisterMember(ctx context.Context, in LoginIdentity) (*L
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	created := false
+	now := time.Now()
 
-	// pg_advisory_xact_lock 以 issuer|subject 的哈希作为 key，事务结束自动释放。
+	// pg_advisory_xact_lock 以 tenant|issuer|subject 的哈希作为 key，事务结束自动释放。
+	// 带上 tenant 避免不同租户同 (issuer,subject) 的流程互相串行/误判。
 	if _, err := tx.Exec(ctx,
-		`SELECT pg_advisory_xact_lock(hashtextextended($1 || '|' || $2, 0))`,
-		in.Issuer, in.Subject); err != nil {
+		`SELECT pg_advisory_xact_lock(hashtextextended($1 || '|' || $2 || '|' || $3, 0))`,
+		in.TenantID.String(), in.Issuer, in.Subject); err != nil {
 		return nil, err
 	}
 
 	var identityID, memberID uuid.UUID
 	var email string
 	var emailVerified bool
+	var status string
 	err = tx.QueryRow(ctx,
-		`SELECT id, member_id, email, email_verified FROM identities
-		 WHERE tenant_id = $1 AND issuer = $2 AND subject = $3`,
+		`SELECT id, member_id, email, email_verified, status FROM identities
+		 WHERE tenant_id = $1 AND issuer = $2 AND subject = $3
+		 FOR UPDATE`,
 		in.TenantID, in.Issuer, in.Subject,
-	).Scan(&identityID, &memberID, &email, &emailVerified)
+	).Scan(&identityID, &memberID, &email, &emailVerified, &status)
 	switch {
 	case err == nil:
+		// 停用待证明的证明窗口已过：显式让旧意图过期、身份恢复 active，
+		// 本次登录继续。窗口之内（deactivation_pending/disabled）一律拒绝登录，
+		// 且不刷新任何字段，延迟到达的旧回调不可能把身份“用活”。
+		if status == "deactivation_pending" {
+			expired, lerr := s.expirePendingDeactivateLocked(ctx, tx, in.TenantID, identityID, now)
+			if lerr != nil {
+				return nil, lerr
+			}
+			if expired {
+				status = "active"
+			}
+		}
+		if status != "active" {
+			return nil, ErrIdentityDisabled
+		}
 		// 已有身份：刷新展示字段，复用既有成员。绝不按邮箱合并账号。
 		if _, err := tx.Exec(ctx,
 			`UPDATE identities SET email = $1, email_verified = $2, updated_at = now()
-			 WHERE id = $3`, in.Email, in.EmailVerified, identityID); err != nil {
+			 WHERE id = $3 AND status = 'active'`, in.Email, in.EmailVerified, identityID); err != nil {
 			return nil, err
 		}
 		if in.DisplayName != "" {
@@ -245,8 +273,8 @@ func (s *Store) LoginOrRegisterMember(ctx context.Context, in LoginIdentity) (*L
 			return nil, mapErr(err)
 		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO identities(id, tenant_id, member_id, issuer, subject, email, email_verified)
-			 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+			`INSERT INTO identities(id, tenant_id, member_id, issuer, subject, email, email_verified, status)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,'active')`,
 			uuid.New(), in.TenantID, memberID, in.Issuer, in.Subject,
 			in.Email, in.EmailVerified); err != nil {
 			return nil, mapErr(err)
@@ -278,10 +306,11 @@ func (s *Store) Member(ctx context.Context, tenantID, memberID uuid.UUID) (*mode
 	return &m, nil
 }
 
-// IdentitiesOfMember 返回成员在本租户内已绑定的全部已核实身份。
+// IdentitiesOfMember 返回成员在本租户内已绑定的全部已核实身份（含已停用，
+// 由调用方按 Status 区分展示与可用）。
 func (s *Store) IdentitiesOfMember(ctx context.Context, tenantID, memberID uuid.UUID) ([]models.Identity, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, tenant_id, member_id, issuer, subject, email, email_verified
+		`SELECT id, tenant_id, member_id, issuer, subject, email, email_verified, status
 		 FROM identities WHERE tenant_id = $1 AND member_id = $2 ORDER BY created_at`,
 		tenantID, memberID)
 	if err != nil {
@@ -292,7 +321,7 @@ func (s *Store) IdentitiesOfMember(ctx context.Context, tenantID, memberID uuid.
 	for rows.Next() {
 		var i models.Identity
 		if err := rows.Scan(&i.ID, &i.TenantID, &i.MemberID, &i.Issuer,
-			&i.Subject, &i.Email, &i.EmailVerified); err != nil {
+			&i.Subject, &i.Email, &i.EmailVerified, &i.Status); err != nil {
 			return nil, err
 		}
 		out = append(out, i)
@@ -304,15 +333,25 @@ func (s *Store) IdentitiesOfMember(ctx context.Context, tenantID, memberID uuid.
 func (s *Store) IdentityByAnchor(ctx context.Context, tenantID uuid.UUID, issuer, subject string) (*models.Identity, error) {
 	var i models.Identity
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, tenant_id, member_id, issuer, subject, email, email_verified
+		`SELECT id, tenant_id, member_id, issuer, subject, email, email_verified, status
 		 FROM identities WHERE tenant_id = $1 AND issuer = $2 AND subject = $3`,
 		tenantID, issuer, subject,
 	).Scan(&i.ID, &i.TenantID, &i.MemberID, &i.Issuer, &i.Subject,
-		&i.Email, &i.EmailVerified)
+		&i.Email, &i.EmailVerified, &i.Status)
 	if err != nil {
 		return nil, mapErr(err)
 	}
 	return &i, nil
+}
+
+// CountActiveIdentities 返回某成员当前可用（active）身份数。
+func (s *Store) CountActiveIdentities(ctx context.Context, tenantID, memberID uuid.UUID) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM identities
+		 WHERE tenant_id = $1 AND member_id = $2 AND status = 'active'`,
+		tenantID, memberID).Scan(&n)
+	return n, err
 }
 
 // ---------- sessions ----------
@@ -474,11 +513,13 @@ func (s *Store) CompleteLink(ctx context.Context, token string, now time.Time, m
 	}
 
 	var aOwner uuid.UUID
+	var aStatus string
 	err = tx.QueryRow(ctx,
-		`SELECT member_id FROM identities
-		 WHERE tenant_id = $1 AND issuer = $2 AND subject = $3`,
+		`SELECT member_id, status FROM identities
+		 WHERE tenant_id = $1 AND issuer = $2 AND subject = $3
+		 FOR UPDATE`,
 		tenantID, aIssuer, aSubject,
-	).Scan(&aOwner)
+	).Scan(&aOwner, &aStatus)
 	if errors.Is(err, pgx.ErrNoRows) {
 		_, _ = tx.Exec(ctx, `UPDATE link_sessions SET status='consumed' WHERE token=$1`, token)
 		_ = tx.Commit(ctx)
@@ -487,7 +528,8 @@ func (s *Store) CompleteLink(ctx context.Context, token string, now time.Time, m
 	if err != nil {
 		return err
 	}
-	if aOwner != anchorMemberID {
+	if aOwner != anchorMemberID || aStatus != "active" {
+		// 锚点身份在关联期间被停用（或正在停用流程中）：不能再由它发起关联。
 		_, _ = tx.Exec(ctx, `UPDATE link_sessions SET status='consumed' WHERE token=$1`, token)
 		_ = tx.Commit(ctx)
 		return ErrConflict
@@ -500,16 +542,18 @@ func (s *Store) CompleteLink(ctx context.Context, token string, now time.Time, m
 	}
 
 	var bOwner uuid.UUID
+	var bStatus string
 	err = tx.QueryRow(ctx,
-		`SELECT member_id FROM identities
-		 WHERE tenant_id = $1 AND issuer = $2 AND subject = $3`,
+		`SELECT member_id, status FROM identities
+		 WHERE tenant_id = $1 AND issuer = $2 AND subject = $3
+		 FOR UPDATE`,
 		tenantID, bIssuer, bSubject,
-	).Scan(&bOwner)
+	).Scan(&bOwner, &bStatus)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO identities(id, tenant_id, member_id, issuer, subject, email, email_verified)
-			 VALUES ($1,$2,$3,$4,$5,$6,true)`,
+			`INSERT INTO identities(id, tenant_id, member_id, issuer, subject, email, email_verified, status)
+			 VALUES ($1,$2,$3,$4,$5,$6,true,'active')`,
 			uuid.New(), tenantID, anchorMemberID, bIssuer, bSubject, bEmail); err != nil {
 			return mapErr(err)
 		}
@@ -519,8 +563,14 @@ func (s *Store) CompleteLink(ctx context.Context, token string, now time.Time, m
 		_, _ = tx.Exec(ctx, `UPDATE link_sessions SET status='consumed' WHERE token=$1`, token)
 		_ = tx.Commit(ctx)
 		return ErrConflict
+	case bStatus != "active":
+		// 目标身份曾属于同一成员但已停用/停用中：延迟到达的关联回调不能把它复活，
+		// 必须走明确的恢复流程。
+		_, _ = tx.Exec(ctx, `UPDATE link_sessions SET status='consumed' WHERE token=$1`, token)
+		_ = tx.Commit(ctx)
+		return ErrIdentityDisabled
 	default:
-		// 已属于同一成员：幂等成功。
+		// 已属于同一成员且可用：幂等成功。
 	}
 
 	if _, err := tx.Exec(ctx,

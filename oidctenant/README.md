@@ -9,6 +9,9 @@
 4. **登录/关联回调重复到达不会创建多个成员**（state 一次性消费 + 咨询锁 + 唯一约束）。
 5. **只允许已配置的回调地址**（精确白名单匹配）。
 6. **身份令牌绝不写进日志**（只记录错误分类，不记录 code/token）。
+7. **身份停用/恢复是显式生命周期**：停用必须用该身份完成一次**新的 OIDC 证明**后才生效，
+   最后一个可用身份不能停用；停用后的登录/关联/并发首次登录遵循同一状态边界，
+   延迟回调与跨租户操作都不能让身份复活；恢复只在明确窗口内、以新增记录建立新状态。
 
 ## 目录结构
 
@@ -21,7 +24,8 @@ internal/models/        持久化数据结构
 internal/store/         所有 PostgreSQL 访问（事务、咨询锁、原子关联）
 internal/oidcx/         go-oidc + oauth2 封装（发现/校验/交换/PKCE/nonce）
 internal/auth/          state/nonce/PKCE/会话令牌随机值与哈希、回调白名单
-internal/api/           HTTP handler：登录、回调、me、登出、账号关联
+internal/api/           HTTP handler：登录、回调、me、登出、账号关联、身份停用/恢复
+internal/auth/          state/nonce/PKCE/会话/生命周期令牌随机值与哈希、回调白名单
 deploy/keycloak/import  acme / globex 两个测试 realm（含同邮箱用户）
 deploy/seed.json        租户/IdP 的 seed 规格
 integration/            针对真实 Keycloak + 真实 PostgreSQL 的端到端集成测试
@@ -34,10 +38,12 @@ integration/            针对真实 Keycloak + 真实 PostgreSQL 的端到端�
 | `tenants` | 租户 |
 | `identity_providers` | 租户**授权**的 `(issuer, client_id, secret, redirect_uris[])`，按 `(tenant_id, issuer)` 唯一 |
 | `members` | 租户内的成员（业务账号） |
-| `identities` | 已核实身份；**`UNIQUE(tenant_id, issuer, subject)` 是身份锚点**；`email` 无唯一约束 |
-| `auth_requests` | 进行中的授权请求：`state` 主键 + `nonce` + `pkce_verifier`，一次性消费（`consumed_at`） |
+| `identities` | 已核实身份；**`UNIQUE(tenant_id, issuer, subject)` 是身份锚点**；`email` 无唯一约束；`status` ∈ `active`/`deactivation_pending`/`disabled` |
+| `auth_requests` | 进行中的授权请求：`state` 主键 + `nonce` + `pkce_verifier`，一次性消费（`consumed_at`）；`kind=lifecycle` 用于停用/恢复证明 |
 | `sessions` | 不透明会话令牌（数据库存 SHA-256 哈希） |
 | `link_sessions` | 账号关联会话：A/B 两条 leg 的 issuer/subject/auth_time，一次性 token |
+| `identity_lifecycles` | 停用/恢复意图：一次性 token 哈希、原因、发起人会话、证明锚点与 `auth_time`、证明窗口 `expires_at`；每身份至多一个 `pending`（部分唯一索引） |
+| `identity_events` | **只追加**的生命周期历史：issuer/subject/原因/时间/证明人；恢复新增记录，绝不覆写停用记录 |
 
 > 关联外部身份时，身份行的 `tenant_id` 是**发起关联的租户**。
 > 因此 A 公司成员关联 B 公司 IdP 的身份，锚点是 `(A租户, B的issuer, subject)`，
@@ -54,10 +60,14 @@ integration/            针对真实 Keycloak + 真实 PostgreSQL 的端到端�
 | error_type | HTTP | 触发场景 |
 | --- | --- | --- |
 | `authentication_failed` | 401 | 签名/受众/issuer/过期/nonce/PKCE/授权码交换失败、会话无效 |
-| `tenant_unauthorized` | 403 | 租户未启用该 issuer、provider 被禁用、跨租户使用会话 |
+| `tenant_unauthorized` | 403 | 租户未启用该 issuer、provider 被禁用、跨租户使用会话、操作他人身份 |
 | `binding_conflict` | 409 | 目标身份已绑给别的成员、自关联、关联会话重放 |
 | `invalid_request` | 400 | state 缺失/已用/伪造、回调地址不在白名单、参数非法 |
-| `reauthentication_required` | 401 | 关联时某一身份未在 `auth_time_max_age` 窗口内重新认证 |
+| `reauthentication_required` | 401 | 关联/生命周期证明时某一身份未在 `auth_time_max_age` 窗口内重新认证 |
+| `identity_disabled` | 403 | 身份已停用或停用流程进行中，登录/关联回调被状态边界拒绝 |
+| `last_identity` | 409 | 试图停用成员当前唯一可用身份（发起时或证明完成时判定） |
+| `identity_lifecycle_conflict` | 409 | 已有并行生命周期流程、一次性证明令牌重放、证明锚点与目标身份不一致 |
+| `identity_lifecycle_expired` | 410 | 证明窗口（`LIFECYCLE_PROOF_TTL`）或恢复窗口（`REACTIVATION_WINDOW`）已过 |
 
 端点：
 
@@ -71,6 +81,10 @@ integration/            针对真实 Keycloak + 真实 PostgreSQL 的端到端�
 | `POST /t/{slug}/api/links` | 发起账号关联，返回 `link_token` 与 `link_url`；body `{"issuer":"..."}` |
 | `GET  /oauth/link/callback` | 关联第二身份的回调（强制重认证） |
 | `GET  /t/{slug}/api/links/{token}` | 查询关联会话状态（一次性） |
+| `POST /t/{slug}/api/identities/deactivate` | 发起身份停用；body `{"issuer","subject","reason"}`，支持 `Idempotency-Key` 重放；返回 `lifecycle_token` 与 `proof_url` |
+| `POST /t/{slug}/api/identities/reactivate` | 在恢复窗口内发起恢复（同样需新 OIDC 证明） |
+| `GET  /oauth/identity/callback` | 停用/恢复的新 OIDC 证明回调（`prompt=login`，一次性 state+token） |
+| `GET  /t/{slug}/api/identities/events?issuer=...&subject=...` | 查询该身份锚点只追加的生命周期历史 |
 
 ## 安全实现细节
 
@@ -94,6 +108,26 @@ integration/            针对真实 Keycloak + 真实 PostgreSQL 的端到端�
 - **日志脱敏**：访问日志把 query 中的 `code/id_token/access_token/refresh_token/state/token`
   统一替换为 `[REDACTED]`；认证失败只记录分类（signature/audience/nonce/...），
   全代码路径不打印原始令牌。
+- **身份停用/恢复生命周期**：
+  - 身份锚点行永不删除，只推进 `status`：`active → deactivation_pending → disabled → active`。
+    发起停用的同一事务即把身份置为 `deactivation_pending`，**从那一刻起**登录回调、
+    关联完成回调（含先于停用出发、延迟到达的旧回调）都被拒绝，不存在“还能再用一次”的窗口。
+  - 停用/恢复必须由该身份本人完成一次新的 OIDC 证明（`prompt=login`、`max_age=0`、
+    校验 `auth_time` 与 provider 窗口）；证明还必须来自发起时的同一会话、同一
+    `(issuer,subject)`，不能用同成员的另一身份顶替。
+  - **最后一个可用身份不能停用**：发起时在成员级咨询锁内计数 `active` 身份；
+    证明完成时再复核一次，若期间另一身份也被停用则拒绝并把流程记为 `rejected`。
+    成员级锁保证并发停用两条身份也无法穿透该规则。
+  - **单一终态**：每身份至多一个 `pending` 流程（部分唯一索引）；
+    `Idempotency-Key` 命中的重放返回原流程而不新建 state/token；
+    lifecycle token 哈希唯一且一次性；终态 UPDATE 全部带 `status` 谓词。
+  - **窗口明确**：证明窗口 `LIFECYCLE_PROOF_TTL`（默认 10m），逾期证明 410；
+    逾期未完成的停用尝试由定时任务/登录路径收敛为 `expired` 并安全回到 `active`；
+    恢复只在 `REACTIVATION_WINDOW`（默认 24h）内允许，窗口外 410，必须重新绑定。
+  - **恢复是新增而非覆写**：恢复产生新的 `identity_lifecycles` 终态行与
+    `identity_reactivated` 事件；停用行、`identity_deactivated` 事件与原因永久可查。
+  - 所有判定键均为 `(tenant_id, issuer, subject)`：跨租户同邮箱身份是不同锚点，
+    A 租户停用/恢复完全不影响 B 租户的同名身份。
 
 ## 本地运行
 
@@ -172,6 +206,18 @@ KC_BASE_URL=http://localhost:8180 go test ./integration/... -v
 | `TestRedirectURIMustBeWhitelisted` | 未登记回调地址 → 400 `invalid_request` |
 | `TestLinkRejectsDisabledProvider` | 关联前禁用 provider 授权 → 403 `tenant_unauthorized` |
 | `TestWrongPasswordIsAuthnFailure` | IdP 凭证错误不产生会话/成员 |
+| `TestIdentityDeactivationLifecycleKeycloak` | 真实 IdP：两身份停用其一 → 该身份 403 不能开会话、另一身份可登录；重放只产生一个终态；历史可查询 |
+| `TestLastIdentityCannotBeDeactivatedKeycloak` | 唯一身份停用 → 409 `last_identity`，数据不变 |
+| `TestReactivationWithinWindowKeycloak` | 窗口内恢复（重新 OIDC 证明）后可再登录，停用历史不被覆写 |
+| `TestDeactivateOneOfTwoIdentities` | 进程内 fake IdP：停用后该身份不能创建会话、另一身份仍可登录，历史归属保留 |
+| `TestCannotDeactivateLastIdentity` | 唯一身份被明确拒绝，lifecycle/event 表零写入 |
+| `TestDeactivationRequestReplaySingleTerminalState` | 幂等键重放命中原流程、不新建 state；完成回调重放 400；只有一个终态与可查询历史 |
+| `TestStaleCallbacksDuringDeactivationDoNotReactivate` | 停用窗口内的旧登录/旧关联回调都被 403 拒绝，身份不复活、锚点不重复 |
+| `TestReactivationWithinWindow` / `TestReactivationOutsideWindowRejected` | 窗口内恢复可用、窗口外 410 且身份保持 disabled |
+| `TestDeactivationProofWindowExpiry` | 逾期证明 410，停用尝试过期、身份安全回到 active，留 `lifecycle_expired` 事件 |
+| `TestCrossTenantSameEmailIdentitiesDoNotInterfere` | 不同租户同邮箱身份停用/恢复互不影响，成员不合并 |
+| `TestConcurrentFirstLoginsDoNotDuplicateWithBoundary` | 并发首次登录（咨询锁+唯一约束）仍只产生一个成员/一条身份 |
+| `TestConcurrentProofCompletionSingleWinner` / `TestConcurrentDeactivationCannotRemoveLastIdentity` | 并发证明完成只有一个终态；并发停用无法穿透“最后可用身份”边界 |
 
 ## 生产化前还应补充（本项目刻意省略）
 

@@ -201,6 +201,11 @@ func (s *Server) loginCallback(w http.ResponseWriter, r *http.Request) {
 		DisplayName:   claims.Name,
 	})
 	if err != nil {
+		if errors.Is(err, store.ErrIdentityDisabled) {
+			// 停用中/已停用身份：OIDC 证明再新鲜也不能建立会话。
+			writeAPIError(w, identityDisabled("this identity has been deactivated and cannot start a session"))
+			return
+		}
 		s.logger.Printf("login upsert failed: %v", err)
 		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "login failed"))
 		return

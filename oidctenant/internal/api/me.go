@@ -13,6 +13,8 @@ type identityView struct {
 	Subject       string `json:"subject"`
 	Email         string `json:"email"`
 	EmailVerified bool   `json:"email_verified"`
+	// Status: active / deactivation_pending / disabled。
+	Status string `json:"status"`
 }
 
 // GET /t/{slug}/api/me
@@ -30,6 +32,7 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 			Subject:       id.Subject,
 			Email:         id.Email,
 			EmailVerified: id.EmailVerified,
+			Status:        id.Status,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{

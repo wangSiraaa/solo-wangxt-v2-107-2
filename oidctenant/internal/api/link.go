@@ -61,11 +61,19 @@ func (s *Server) linkStart(w http.ResponseWriter, r *http.Request) {
 	}
 	var anchor *models.Identity
 	if req.AnchorIssuer == "" {
-		if len(ids) != 1 {
-			writeAPIError(w, badRequest("anchor_issuer is required when the member has multiple identities"))
+		for i := range ids {
+			if ids[i].Status == "active" {
+				if anchor != nil {
+					writeAPIError(w, badRequest("anchor_issuer is required when the member has multiple identities"))
+					return
+				}
+				anchor = &ids[i]
+			}
+		}
+		if anchor == nil {
+			writeAPIError(w, identityDisabled("no active identity is available to anchor the link"))
 			return
 		}
-		anchor = &ids[0]
 	} else {
 		for i := range ids {
 			if ids[i].Issuer == req.AnchorIssuer {
@@ -75,6 +83,11 @@ func (s *Server) linkStart(w http.ResponseWriter, r *http.Request) {
 		}
 		if anchor == nil {
 			writeAPIError(w, conflict("anchor issuer is not bound to the current member"))
+			return
+		}
+		if anchor.Status != "active" {
+			// 已停用/停用中的身份不能再作为关联锚点发起新绑定。
+			writeAPIError(w, identityDisabled("the anchor identity has been deactivated"))
 			return
 		}
 	}
@@ -317,11 +330,14 @@ func (s *Server) linkFinalize(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) mapLinkError(err error) *APIError {
 	switch {
+	case errors.Is(err, store.ErrIdentityDisabled):
+		// 目标身份已停用/停用中：过期关联回调不能复活它，必须走显式恢复。
+		return identityDisabled("the target identity has been deactivated; reactivate it before linking")
 	case errors.Is(err, store.ErrNotFound):
 		return conflict("link session expired or was not found")
 	case errors.Is(err, store.ErrConflict):
-		// 目标 (issuer,subject) 已属于别的成员、同身份自关联或会话状态非法。
-		return conflict("target identity is already bound to another member")
+		// 目标 (issuer,subject) 已属于别的成员、同身份自关联、锚点停用或会话状态非法。
+		return conflict("target identity is already bound to another member or the anchor changed")
 	}
 	if msg, ok := store.AsReauth(err); ok {
 		return reauthRequired(msg)

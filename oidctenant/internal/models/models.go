@@ -12,6 +12,8 @@ import (
 type (
 	NullString = sql.NullString
 	NullTime   = sql.NullTime
+	// NullUUID 是可空 uuid（Go 1.22+ 的泛型 sql.Null）。
+	NullUUID = sql.Null[uuid.UUID]
 )
 
 type Tenant struct {
@@ -49,6 +51,49 @@ type Identity struct {
 	Subject       string
 	Email         string
 	EmailVerified bool
+	// Status 为身份生命周期状态：
+	// active（可用）/ deactivation_pending（停用待证明，已不可登录）/ disabled（已停用）。
+	Status string
+}
+
+// IdentityLifecycle 是一次停用/恢复意图：必须由身份持有者完成新的 OIDC
+// 证明（auth_time 在窗口内）后才推进到终态。
+type IdentityLifecycle struct {
+	ID             uuid.UUID
+	TenantID       uuid.UUID
+	IdentityID     uuid.UUID
+	MemberID       uuid.UUID
+	Kind           string // deactivate | reactivate
+	Status         string // pending | deactivated | reactivated | expired
+	TokenHash      []byte
+	IdempotencyKey NullString
+	Issuer         string
+	Subject        string
+	Reason         string
+	SessionID      uuid.UUID
+	ProofIssuer    string
+	ProofSubject   string
+	ProofAuthTime  NullTime
+	CreatedAt      time.Time
+	ExpiresAt      time.Time
+	CompletedAt    NullTime
+}
+
+// IdentityEvent 是只追加的身份生命周期历史记录。
+type IdentityEvent struct {
+	ID            uuid.UUID
+	TenantID      uuid.UUID
+	IdentityID    NullUUID
+	LifecycleID   NullUUID
+	MemberID      NullUUID
+	Kind          string
+	Issuer        string
+	Subject       string
+	Reason        string
+	ProofIssuer   string
+	ProofSubject  string
+	ProofAuthTime NullTime
+	CreatedAt     time.Time
 }
 
 type AuthRequest struct {

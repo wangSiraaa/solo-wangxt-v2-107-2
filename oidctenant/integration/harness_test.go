@@ -34,11 +34,12 @@ import (
 )
 
 const (
-	kcBaseURLDefault = "http://localhost:8180"
-	appPort          = "18080" // 避开开发机常见端口
-	appBaseURL       = "http://localhost:" + appPort
-	loginCallback    = appBaseURL + "/oauth/callback"
-	linkCallback     = appBaseURL + "/oauth/link/callback"
+	kcBaseURLDefault  = "http://localhost:8180"
+	appPort           = "18080" // 避开开发机常见端口
+	appBaseURL        = "http://localhost:" + appPort
+	loginCallback     = appBaseURL + "/oauth/callback"
+	linkCallback      = appBaseURL + "/oauth/link/callback"
+	lifecycleCallback = appBaseURL + "/oauth/identity/callback"
 )
 
 // 固定 UUID，便于 seed 与断言引用。
@@ -111,39 +112,41 @@ func startEnv(t *testing.T) *testEnv {
 	seedTenant(t, st, tenantAcmeID, "acme", "Acme Corp", models.Provider{
 		ID: idpAcmeSelfID, TenantID: tenantAcmeID,
 		Issuer: issuer("acme"), ClientID: "acme-rp", ClientSecret: "acme-rp-secret",
-		RedirectURIs:   []string{loginCallback, linkCallback},
+		RedirectURIs:   []string{loginCallback, linkCallback, lifecycleCallback},
 		AuthTimeMaxAge: 300, Enabled: true,
 	})
 	// acme 额外授权外部 globex issuer：凭证是 globex realm 的客户端（关联用）。
 	seedTenant(t, st, tenantAcmeID, "acme", "Acme Corp", models.Provider{
 		ID: idpAcmeGlobexID, TenantID: tenantAcmeID,
 		Issuer: issuer("globex"), ClientID: "globex-rp", ClientSecret: "globex-rp-secret",
-		RedirectURIs:   []string{loginCallback, linkCallback},
+		RedirectURIs:   []string{loginCallback, linkCallback, lifecycleCallback},
 		AuthTimeMaxAge: 300, Enabled: true,
 	})
 	seedTenant(t, st, tenantGlobexID, "globex", "Globex Inc", models.Provider{
 		ID: idpGlobexSelfID, TenantID: tenantGlobexID,
 		Issuer: issuer("globex"), ClientID: "globex-rp", ClientSecret: "globex-rp-secret",
-		RedirectURIs:   []string{loginCallback, linkCallback},
+		RedirectURIs:   []string{loginCallback, linkCallback, lifecycleCallback},
 		AuthTimeMaxAge: 300, Enabled: true,
 	})
 	// globex 额外授权外部 acme issuer。
 	seedTenant(t, st, tenantGlobexID, "globex", "Globex Inc", models.Provider{
 		ID: idpGlobexAcmeID, TenantID: tenantGlobexID,
 		Issuer: issuer("acme"), ClientID: "acme-rp", ClientSecret: "acme-rp-secret",
-		RedirectURIs:   []string{loginCallback, linkCallback},
+		RedirectURIs:   []string{loginCallback, linkCallback, lifecycleCallback},
 		AuthTimeMaxAge: 300, Enabled: true,
 	})
 
 	cfg := &config.Config{
-		DatabaseURL:    dsn,
-		BaseURL:        appBaseURL,
-		Addr:           ":" + appPort,
-		SessionTTL:     time.Hour,
-		LinkTTL:        10 * time.Minute,
-		AuthRequestTTL: 10 * time.Minute,
-		CookieSecure:   false,
-		CookieSameSite: "lax",
+		DatabaseURL:        dsn,
+		BaseURL:            appBaseURL,
+		Addr:               ":" + appPort,
+		SessionTTL:         time.Hour,
+		LinkTTL:            10 * time.Minute,
+		AuthRequestTTL:     10 * time.Minute,
+		LifecycleProofTTL:  10 * time.Minute,
+		ReactivationWindow: 24 * time.Hour,
+		CookieSecure:       false,
+		CookieSameSite:     "lax",
 	}
 	httpSrv := &http.Server{
 		Addr: ":" + appPort,

@@ -18,8 +18,16 @@ const (
 	ErrBindingConflict ErrorType = "binding_conflict"
 	// ErrInvalidRequest 请求参数非法或回调地址不在白名单。
 	ErrInvalidRequest ErrorType = "invalid_request"
-	// ErrReauthRequired 关联账号时身份未在规定时间内重新认证。
+	// ErrReauthRequired 关联账号/生命周期证明时身份未在规定时间内重新认证。
 	ErrReauthRequired ErrorType = "reauthentication_required"
+	// ErrIdentityDisabled 身份已停用（或停用流程进行中），不能再建立会话/绑定。
+	ErrIdentityDisabled ErrorType = "identity_disabled"
+	// ErrLastIdentity 这是成员当前唯一可用身份，禁止停用。
+	ErrLastIdentity ErrorType = "last_identity"
+	// ErrLifecycleConflict 停用/恢复流程当前状态不允许该操作（并发请求/重放）。
+	ErrLifecycleConflict ErrorType = "identity_lifecycle_conflict"
+	// ErrLifecycleExpired 证明窗口或恢复窗口已过，旧回调/旧请求不得推进状态。
+	ErrLifecycleExpired ErrorType = "identity_lifecycle_expired"
 )
 
 // APIError 携带 HTTP 状态、稳定错误码与可展示的简短描述。
@@ -54,6 +62,23 @@ func badRequest(msg string) *APIError {
 
 func reauthRequired(msg string) *APIError {
 	return newAPIError(http.StatusUnauthorized, ErrReauthRequired, msg)
+}
+
+func identityDisabled(msg string) *APIError {
+	return newAPIError(http.StatusForbidden, ErrIdentityDisabled, msg)
+}
+
+func lastIdentity(msg string) *APIError {
+	return newAPIError(http.StatusConflict, ErrLastIdentity, msg)
+}
+
+func lifecycleConflict(msg string) *APIError {
+	return newAPIError(http.StatusConflict, ErrLifecycleConflict, msg)
+}
+
+func lifecycleExpired(msg string) *APIError {
+	// 410 Gone：窗口是明确的一次性资源，窗口外的恢复/证明必须与普通冲突区分。
+	return newAPIError(http.StatusGone, ErrLifecycleExpired, msg)
 }
 
 func asAPIError(err error) (*APIError, bool) {
