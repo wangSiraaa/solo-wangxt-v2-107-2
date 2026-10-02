@@ -41,27 +41,39 @@ type Member struct {
 	CreatedAt   time.Time
 }
 
+const (
+	// IdentityStatusActive 身份正常，可登录/关联。
+	IdentityStatusActive = "active"
+	// IdentityStatusDeactivated 身份已停用：历史归属保留，但不能再建立会话或参与关联。
+	IdentityStatusDeactivated = "deactivated"
+)
+
 type Identity struct {
-	ID            uuid.UUID
-	TenantID      uuid.UUID
-	MemberID      uuid.UUID
-	Issuer        string
-	Subject       string
-	Email         string
-	EmailVerified bool
+	ID              uuid.UUID
+	TenantID        uuid.UUID
+	MemberID        uuid.UUID
+	Issuer          string
+	Subject         string
+	Email           string
+	EmailVerified   bool
+	Status          string
+	DeactivatedAt   NullTime
+	ReactivateAfter NullTime
+	ReactivateUntil NullTime
 }
 
 type AuthRequest struct {
-	State        string
-	Kind         string
-	TenantID     uuid.UUID
-	IDPID        uuid.UUID
-	Nonce        string
-	PKCEVerifier string
-	ReturnTo     string
-	LinkToken    NullString
-	SessionID    *uuid.UUID
-	CreatedAt    time.Time
+	State          string
+	Kind           string
+	TenantID       uuid.UUID
+	IDPID          uuid.UUID
+	Nonce          string
+	PKCEVerifier   string
+	ReturnTo       string
+	LinkToken      NullString
+	LifecycleToken NullString
+	SessionID      *uuid.UUID
+	CreatedAt      time.Time
 }
 
 type Session struct {
@@ -89,4 +101,40 @@ type LinkSession struct {
 	BState         string
 	Status         string
 	ExpiresAt      time.Time
+}
+
+// LifecycleSession 是身份停用/恢复流程中等待 OIDC 证明的一次性会话。
+type LifecycleSession struct {
+	Token        string
+	TenantID     uuid.UUID
+	IdentityID   uuid.UUID
+	MemberID     uuid.UUID
+	SessionID    uuid.UUID
+	IDPID        uuid.UUID
+	Kind         string // "deactivate" | "reactivate"
+	Issuer       string
+	Subject      string
+	Reason       string
+	PendingState string
+	Status       string // "pending" | "completed" | "consumed"
+	ExpiresAt    time.Time
+	WindowUntil  NullTime
+	CreatedAt    time.Time
+}
+
+// LifecycleEvent 是身份生命周期的不可变历史事件（只追加）。
+type LifecycleEvent struct {
+	ID              uuid.UUID
+	TenantID        uuid.UUID
+	IdentityID      uuid.UUID
+	MemberID        uuid.UUID
+	Issuer          string
+	Subject         string
+	Action          string // "deactivated" | "reactivated"
+	Reason          string
+	ActorSessionID  uuid.NullUUID
+	ProvenAuthTime  time.Time
+	ReactivateAfter NullTime
+	ReactivateUntil NullTime
+	CreatedAt       time.Time
 }

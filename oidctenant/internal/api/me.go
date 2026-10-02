@@ -9,10 +9,12 @@ import (
 
 // identityView 暴露给业务接口的身份信息。
 type identityView struct {
-	Issuer        string `json:"issuer"`
-	Subject       string `json:"subject"`
-	Email         string `json:"email"`
-	EmailVerified bool   `json:"email_verified"`
+	Issuer          string `json:"issuer"`
+	Subject         string `json:"subject"`
+	Email           string `json:"email"`
+	EmailVerified   bool   `json:"email_verified"`
+	Status          string `json:"status"`
+	ReactivateAfter string `json:"reactivate_after,omitempty"`
 }
 
 // GET /t/{slug}/api/me
@@ -25,12 +27,17 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]identityView, 0, len(ids))
 	for _, id := range ids {
-		out = append(out, identityView{
+		v := identityView{
 			Issuer:        id.Issuer,
 			Subject:       id.Subject,
 			Email:         id.Email,
 			EmailVerified: id.EmailVerified,
-		})
+			Status:        id.Status,
+		}
+		if id.ReactivateAfter.Valid {
+			v.ReactivateAfter = id.ReactivateAfter.Time.UTC().Format("2006-01-02T15:04:05Z07:00")
+		}
+		out = append(out, v)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"member_id":  ac.member.ID.String(),

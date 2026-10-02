@@ -201,6 +201,11 @@ func (s *Server) loginCallback(w http.ResponseWriter, r *http.Request) {
 		DisplayName:   claims.Name,
 	})
 	if err != nil {
+		if errors.Is(err, store.ErrIdentityDeactivated) {
+			// 停用身份的登录回调：明确的 403 状态边界，不创建会话也不复活身份。
+			writeAPIError(w, identityInactive("this identity has been deactivated and cannot establish a session"))
+			return
+		}
 		s.logger.Printf("login upsert failed: %v", err)
 		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "login failed"))
 		return

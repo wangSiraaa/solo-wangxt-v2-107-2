@@ -34,11 +34,13 @@ import (
 )
 
 const (
-	kcBaseURLDefault = "http://localhost:8180"
-	appPort          = "18080" // 避开开发机常见端口
-	appBaseURL       = "http://localhost:" + appPort
-	loginCallback    = appBaseURL + "/oauth/callback"
-	linkCallback     = appBaseURL + "/oauth/link/callback"
+	kcBaseURLDefault   = "http://localhost:8180"
+	appPort            = "18080" // 避开开发机常见端口
+	appBaseURL         = "http://localhost:" + appPort
+	loginCallback      = appBaseURL + "/oauth/callback"
+	linkCallback       = appBaseURL + "/oauth/link/callback"
+	deactivateCallback = appBaseURL + "/oauth/identities/deactivate/callback"
+	reactivateCallback = appBaseURL + "/oauth/identities/reactivate/callback"
 )
 
 // 固定 UUID，便于 seed 与断言引用。
@@ -111,27 +113,27 @@ func startEnv(t *testing.T) *testEnv {
 	seedTenant(t, st, tenantAcmeID, "acme", "Acme Corp", models.Provider{
 		ID: idpAcmeSelfID, TenantID: tenantAcmeID,
 		Issuer: issuer("acme"), ClientID: "acme-rp", ClientSecret: "acme-rp-secret",
-		RedirectURIs:   []string{loginCallback, linkCallback},
+		RedirectURIs:   []string{loginCallback, linkCallback, deactivateCallback, reactivateCallback},
 		AuthTimeMaxAge: 300, Enabled: true,
 	})
 	// acme 额外授权外部 globex issuer：凭证是 globex realm 的客户端（关联用）。
 	seedTenant(t, st, tenantAcmeID, "acme", "Acme Corp", models.Provider{
 		ID: idpAcmeGlobexID, TenantID: tenantAcmeID,
 		Issuer: issuer("globex"), ClientID: "globex-rp", ClientSecret: "globex-rp-secret",
-		RedirectURIs:   []string{loginCallback, linkCallback},
+		RedirectURIs:   []string{loginCallback, linkCallback, deactivateCallback, reactivateCallback},
 		AuthTimeMaxAge: 300, Enabled: true,
 	})
 	seedTenant(t, st, tenantGlobexID, "globex", "Globex Inc", models.Provider{
 		ID: idpGlobexSelfID, TenantID: tenantGlobexID,
 		Issuer: issuer("globex"), ClientID: "globex-rp", ClientSecret: "globex-rp-secret",
-		RedirectURIs:   []string{loginCallback, linkCallback},
+		RedirectURIs:   []string{loginCallback, linkCallback, deactivateCallback, reactivateCallback},
 		AuthTimeMaxAge: 300, Enabled: true,
 	})
 	// globex 额外授权外部 acme issuer。
 	seedTenant(t, st, tenantGlobexID, "globex", "Globex Inc", models.Provider{
 		ID: idpGlobexAcmeID, TenantID: tenantGlobexID,
 		Issuer: issuer("acme"), ClientID: "acme-rp", ClientSecret: "acme-rp-secret",
-		RedirectURIs:   []string{loginCallback, linkCallback},
+		RedirectURIs:   []string{loginCallback, linkCallback, deactivateCallback, reactivateCallback},
 		AuthTimeMaxAge: 300, Enabled: true,
 	})
 
@@ -142,20 +144,33 @@ func startEnv(t *testing.T) *testEnv {
 		SessionTTL:     time.Hour,
 		LinkTTL:        10 * time.Minute,
 		AuthRequestTTL: 10 * time.Minute,
-		CookieSecure:   false,
-		CookieSameSite: "lax",
+		// 测试中冷却期为 0（停用后即可发起恢复），恢复窗口 10 分钟；
+		// “窗口外”用例通过直接改写库内窗口边界来验证。
+		LifecycleChallengeTTL: 10 * time.Minute,
+		ReactivateCooldown:    0,
+		ReactivateTTL:         10 * time.Minute,
+		CookieSecure:          false,
+		CookieSameSite:        "lax",
 	}
 	httpSrv := &http.Server{
 		Addr: ":" + appPort,
 		Handler: api.NewServer(cfg, st, oidcx.NewManager(),
 			log.New(os.Stdout, "[test-api] ", log.LstdFlags|log.Lmicroseconds)).Routes(),
 	}
-	go func() { _ = httpSrv.ListenAndServe() }()
+	// 同一进程内多个用例顺序复用固定端口 18080（Keycloak 只登记了该回调端口）。
+	// 显式 Listen 并重试绑定，避免上一用例 Shutdown 尚未释放端口时新服务启动失败。
+	ln := listenWithRetry(t, ":"+appPort, 10*time.Second)
+	go func() {
+		if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			t.Logf("test http server: %v", err)
+		}
+	}()
 	waitReady(t, appBaseURL+"/healthz")
 	t.Cleanup(func() {
 		shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = httpSrv.Shutdown(shCtx)
+		_ = ln.Close()
 		database.Close()
 	})
 

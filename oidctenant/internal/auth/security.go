@@ -33,6 +33,12 @@ func SessionToken() (string, error) { return RandomToken(32) }
 // LinkToken 返回账号关联会话的不透明令牌（256 bit 熵）。
 func LinkToken() (string, error) { return RandomToken(32) }
 
+// LifecycleToken 返回身份停用/恢复生命周期会话的不透明令牌（256 bit 熵）。
+func LifecycleToken() (string, error) { return RandomToken(32) }
+
+// IdempotencyKey 返回发起方未显式提供时使用的服务端幂等键（256 bit 熵）。
+func IdempotencyKey() (string, error) { return RandomToken(32) }
+
 // HashToken 返回令牌的 SHA-256 摘要用于数据库存储/恒定时间比较。
 func HashToken(token string) []byte {
 	sum := sha256.Sum256([]byte(token))

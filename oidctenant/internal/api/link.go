@@ -319,6 +319,9 @@ func (s *Server) mapLinkError(err error) *APIError {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		return conflict("link session expired or was not found")
+	case errors.Is(err, store.ErrIdentityDeactivated):
+		// 关联进行期间某一身份被停用：迟到回调必须停在状态边界。
+		return identityInactive("an identity involved in this link has been deactivated")
 	case errors.Is(err, store.ErrConflict):
 		// 目标 (issuer,subject) 已属于别的成员、同身份自关联或会话状态非法。
 		return conflict("target identity is already bound to another member")

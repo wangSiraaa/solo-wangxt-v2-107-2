@@ -17,9 +17,11 @@ import (
 
 const (
 	// callbackPath 是应用唯一的 OIDC 回调路径，redirect_uri 由 BASE_URL 拼接。
-	callbackPath  = "/oauth/callback"
-	linkCBPath    = "/oauth/link/callback"
-	sessionCookie = "sid"
+	callbackPath     = "/oauth/callback"
+	linkCBPath       = "/oauth/link/callback"
+	deactivateCBPath = "/oauth/identities/deactivate/callback"
+	reactivateCBPath = "/oauth/identities/reactivate/callback"
+	sessionCookie    = "sid"
 )
 
 type ctxKey string
@@ -62,6 +64,13 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /t/{slug}/api/links", s.requireSession(s.linkStart))
 	mux.HandleFunc("GET "+linkCBPath, s.requireSession(s.linkCallback))
 	mux.HandleFunc("GET /t/{slug}/api/links/{token}", s.requireSession(s.linkFinalize))
+
+	// 身份停用与恢复生命周期
+	mux.HandleFunc("POST /t/{slug}/api/identities/deactivations", s.requireSession(s.deactivateStart))
+	mux.HandleFunc("GET "+deactivateCBPath, s.requireSession(s.lifecycleCallback("deactivate")))
+	mux.HandleFunc("POST /t/{slug}/api/identities/reactivations", s.requireSession(s.reactivateStart))
+	mux.HandleFunc("GET "+reactivateCBPath, s.requireSession(s.lifecycleCallback("reactivate")))
+	mux.HandleFunc("GET /t/{slug}/api/identities/history", s.requireSession(s.identityHistory))
 
 	// 受保护的业务接口
 	mux.HandleFunc("GET /t/{slug}/api/me", s.requireSession(s.me))
